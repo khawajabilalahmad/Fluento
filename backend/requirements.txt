@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+sqlalchemy
+langgraph
+langchain-core
+langchain-openai
+python-dotenv
+python-multipart
+gTTS
