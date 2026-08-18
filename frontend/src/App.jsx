@@ -7,15 +7,14 @@ function App() {
   const [isRecording, setIsRecording] = useState(false)
   const [audioUrl, setAudioUrl] = useState(null)
   const [uploadStatus, setUploadStatus] = useState(null)
-  const [transcript, setTranscript] = useState(null)
-  const [tutorResponse, setTutorResponse] = useState(null)
+  const [history, setHistory] = useState([])
   
   const mediaRecorderRef = useRef(null)
   const audioChunksRef = useRef([])
 
   useEffect(() => {
     // Note: The frontend will attempt to connect to the FastAPI backend running locally on port 8000
-    fetch('http://localhost:8000/api/health')
+    fetch('http://127.0.0.1:8000/api/health')
       .then(res => res.json())
       .then(data => setHealth(data))
       .catch(err => setError(err.message))
@@ -24,8 +23,6 @@ function App() {
   const startRecording = async () => {
     setUploadStatus(null)
     setAudioUrl(null)
-    setTranscript(null)
-    setTutorResponse(null)
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       mediaRecorderRef.current = new MediaRecorder(stream)
@@ -66,11 +63,12 @@ function App() {
   const uploadAudio = async (blob) => {
     setUploadStatus("Uploading...")
     const formData = new FormData()
-    // Append the audio file
+    // Append the audio file and history
     formData.append('audio', blob, 'recording.webm')
+    formData.append('history', JSON.stringify(history))
     
     try {
-      const response = await fetch('http://localhost:8000/api/conversation/turn', {
+      const response = await fetch('http://127.0.0.1:8000/api/conversation/turn', {
         method: 'POST',
         body: formData,
       })
@@ -78,11 +76,14 @@ function App() {
       const result = await response.json()
       if (response.ok) {
         setUploadStatus(`Success: ${result.message}`)
-        if (result.transcript) {
-          setTranscript(result.transcript)
-        }
-        if (result.response_text) {
-          setTutorResponse(result.response_text)
+        
+        // Add the new turn to the history
+        if (result.transcript && result.response_text) {
+          setHistory(prev => [
+            ...prev,
+            { role: 'user', content: result.transcript },
+            { role: 'tutor', content: result.response_text }
+          ])
         }
         if (result.audio_base64) {
           const audio = new Audio("data:audio/mp3;base64," + result.audio_base64);
@@ -146,17 +147,22 @@ function App() {
           </div>
         )}
 
-        {transcript && (
-          <div style={{ marginTop: '1rem', padding: '1rem', background: '#e3f2fd', border: '1px solid #bbdefb', borderRadius: '4px' }}>
-            <strong>Transcript (You said):</strong> <br/>
-            <p style={{ marginTop: '0.5rem', fontSize: '1.1rem' }}>"{transcript}"</p>
-          </div>
-        )}
-
-        {tutorResponse && (
-          <div style={{ marginTop: '1rem', padding: '1rem', background: '#f1f8e9', border: '1px solid #c5e1a5', borderRadius: '4px' }}>
-            <strong>Tutor Response:</strong> <br/>
-            <p style={{ marginTop: '0.5rem', fontSize: '1.1rem' }}>{tutorResponse}</p>
+        {history.length > 0 && (
+          <div style={{ marginTop: '2rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+            <h3>Chat History</h3>
+            {history.map((msg, idx) => (
+              <div key={idx} style={{ 
+                alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                background: msg.role === 'user' ? '#e3f2fd' : '#f1f8e9',
+                border: `1px solid ${msg.role === 'user' ? '#bbdefb' : '#c5e1a5'}`,
+                padding: '1rem', 
+                borderRadius: '8px',
+                maxWidth: '80%'
+              }}>
+                <strong>{msg.role === 'user' ? 'You' : 'Tutor'}:</strong>
+                <p style={{ marginTop: '0.5rem', fontSize: '1.1rem' }}>{msg.content}</p>
+              </div>
+            ))}
           </div>
         )}
       </div>
