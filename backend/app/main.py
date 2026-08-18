@@ -1,18 +1,34 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+import json
 from fastapi.middleware.cors import CORSMiddleware
 import shutil
 import os
 from openai import OpenAI
 from dotenv import load_dotenv
 
+from dotenv import load_dotenv
+
 load_dotenv()
+
+from app.database.database import engine, Base, SessionLocal
+from app.models.models import User
+from app.agents.graph import tutor_graph
+
+# Initialize DB
+Base.metadata.create_all(bind=engine)
+# Seed default user
+db = SessionLocal()
+if not db.query(User).filter(User.id == 1).first():
+    db.add(User(name="Student"))
+    db.commit()
+db.close()
 
 app = FastAPI(title="Agentic English Improver API")
 
 # Configure CORS for frontend communication
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,7 +48,10 @@ def health_check():
     return {"status": "ok", "message": "Backend is running successfully"}
 
 @app.post("/api/conversation/turn")
-async def conversation_turn(audio: UploadFile = File(...)):
+async def conversation_turn(
+    audio: UploadFile = File(...),
+    history: str = Form("[]")
+):
     if not audio.filename:
         raise HTTPException(status_code=400, detail="No audio file provided")
 
@@ -53,25 +72,24 @@ async def conversation_turn(audio: UploadFile = File(...)):
                 response_format="text"
             )
             
-        # Call LLM Conversation
-        llm_model = os.getenv("LLM_MODEL", "qwen/qwen3.6-27b").strip(" '\"")
-        completion = client.chat.completions.create(
-            model=llm_model,
-            messages=[
-                {"role": "system", "content": "You are a helpful, friendly English tutor. Keep your responses conversational and relatively short. Do not over-correct every small mistake, just keep the conversation flowing naturally."},
-                {"role": "user", "content": transcription}
-            ],
-            temperature=0.7,
-            max_tokens=1024
-        )
-        import re
-        raw_response = completion.choices[0].message.content
-        # Remove <think>...</think> blocks, even if unclosed
-        response_text = re.sub(r'<think>.*?(?:</think>|$)', '', raw_response, flags=re.DOTALL).strip()
+        # Parse history
+        try:
+            conversation_history = json.loads(history)
+        except:
+            conversation_history = []
+            
+        # Call LangGraph workflow
+        initial_state = {
+            "transcript": transcription,
+            "user_id": 1,
+            "conversation_history": conversation_history,
+            "mistakes_detected": [],
+            "tutor_instruction": "",
+            "tutor_response": ""
+        }
         
-        # If the model used all its tokens thinking and didn't output an answer
-        if not response_text:
-            response_text = "I'm sorry, I was thinking too hard and forgot to actually answer!"
+        result = tutor_graph.invoke(initial_state)
+        response_text = result["tutor_response"]
             
         # Generate Text-to-Speech audio
         from gtts import gTTS
