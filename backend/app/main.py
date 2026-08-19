@@ -11,8 +11,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.database.database import engine, Base, SessionLocal
-from app.models.models import User
-from app.agents.graph import tutor_graph
+from app.models.models import User, Mistake
+from sqlalchemy import desc
+from app.agents.graph import tutor_graph, design_lesson
 
 # Initialize DB
 Base.metadata.create_all(bind=engine)
@@ -47,6 +48,54 @@ client = OpenAI(
 def health_check():
     return {"status": "ok", "message": "Backend is running successfully"}
 
+@app.get("/api/lesson/pending")
+def check_pending_lesson():
+    db = SessionLocal()
+    # Check if there's any mistake that reached the threshold (e.g., >= 3)
+    pending = db.query(Mistake).filter(Mistake.user_id == 1, Mistake.count >= 3).order_by(desc(Mistake.count)).first()
+    db.close()
+    if pending:
+        return {"status": "success", "has_pending": True, "topic": pending.category}
+    return {"status": "success", "has_pending": False}
+
+@app.get("/api/lesson/suggest")
+def suggest_lesson():
+    db = SessionLocal()
+    # Find most frequent mistake
+    top_mistake = db.query(Mistake).filter(Mistake.user_id == 1).order_by(desc(Mistake.count)).first()
+    db.close()
+    
+    topic = "Present Simple vs Present Continuous"
+    if top_mistake and top_mistake.count >= 2:
+        topic = top_mistake.error_text
+        
+    # generate lesson directly via tool
+    lesson_json_str = design_lesson.invoke({"topic": topic})
+    try:
+        lesson_data = json.loads(lesson_json_str)
+        return {"status": "success", "lesson": lesson_data}
+    except Exception as e:
+        return {"status": "error", "message": "Failed to generate lesson.", "details": str(e)}
+
+@app.get("/api/conversation/summary")
+def get_summary():
+    db = SessionLocal()
+    # Get top 10 most recent mistakes
+    recent_mistakes = db.query(Mistake).filter(Mistake.user_id == 1).order_by(desc(Mistake.last_seen)).limit(10).all()
+    
+    mistakes_list = []
+    for m in recent_mistakes:
+        mistakes_list.append({
+            "error_text": m.error_text,
+            "correction": m.correction,
+            "category": m.category,
+            "count": m.count,
+            "last_seen": m.last_seen.isoformat() if m.last_seen else None
+        })
+    db.close()
+    
+    return {"status": "success", "mistakes": mistakes_list}
+
 @app.post("/api/conversation/turn")
 async def conversation_turn(
     audio: UploadFile = File(...),
@@ -69,7 +118,8 @@ async def conversation_turn(
             transcription = client.audio.transcriptions.create(
                 model=os.getenv("STT_MODEL", "whisper-large-v3"), 
                 file=audio_file,
-                response_format="text"
+                response_format="text",
+                language="en"
             )
             
         # Parse history
@@ -78,25 +128,54 @@ async def conversation_turn(
         except:
             conversation_history = []
             
-        # Call LangGraph workflow
-        initial_state = {
-            "transcript": transcription,
-            "user_id": 1,
-            "conversation_history": conversation_history,
-            "mistakes_detected": [],
-            "tutor_instruction": "",
-            "tutor_response": ""
-        }
+        # Prepare history for ReAct agent
+        from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+        messages = []
+        for msg in conversation_history:
+            if msg.get("role") == "user":
+                messages.append(HumanMessage(content=msg.get("content")))
+            else:
+                messages.append(AIMessage(content=msg.get("content")))
+        messages.append(HumanMessage(content=transcription))
         
-        result = tutor_graph.invoke(initial_state)
-        response_text = result["tutor_response"]
+        initial_state = {"messages": messages}
+        
+        result = await tutor_graph.ainvoke(initial_state)
+        response_content = result["messages"][-1].content
+        
+        # Gemini sometimes returns content as a list of blocks instead of a string
+        if isinstance(response_content, list):
+            parts = []
+            for block in response_content:
+                if isinstance(block, dict) and "text" in block:
+                    parts.append(block["text"])
+                elif isinstance(block, str):
+                    parts.append(block)
+                else:
+                    parts.append(str(block))
+            response_text = " ".join(parts).strip()
+        else:
+            response_text = str(response_content).strip()
+            
+        if not response_text:
+            response_text = "I'm sorry, I encountered an error and couldn't formulate a response."
+        
+        # Extract lesson if the design_lesson tool was called
+        lesson_data = None
+        for msg in result["messages"]:
+            if isinstance(msg, ToolMessage) and msg.name == "design_lesson":
+                try:
+                    lesson_data = json.loads(msg.content)
+                except:
+                    pass
             
         # Generate Text-to-Speech audio
-        from gtts import gTTS
         import base64
-        tts = gTTS(text=response_text, lang='en')
+        import edge_tts
         tts_file = os.path.join(temp_dir, f"tts_{audio.filename}.mp3")
-        tts.save(tts_file)
+        
+        communicate = edge_tts.Communicate(response_text, "en-US-AriaNeural")
+        await communicate.save(tts_file)
         
         with open(tts_file, "rb") as f:
             audio_base64 = base64.b64encode(f.read()).decode('utf-8')
@@ -106,6 +185,7 @@ async def conversation_turn(
             "transcript": transcription,
             "response_text": response_text,
             "audio_base64": audio_base64,
+            "lesson": lesson_data,
             "message": "Processed successfully."
         }
     except Exception as e:
