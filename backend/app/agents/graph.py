@@ -1,68 +1,65 @@
 import os
-from typing import TypedDict, List, Dict, Any
-from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI
-from app.schemas.schemas import TranscriptAnalysis, TutorInstruction
+from typing import TypedDict, List, Dict, Any, Optional, Sequence
+import json
+from langchain_core.tools import tool
+from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, ToolMessage
+from langgraph.prebuilt import create_react_agent
+from langchain_google_genai import ChatGoogleGenerativeAI
+from app.schemas.schemas import TranscriptAnalysis, Lesson
 from app.database.database import SessionLocal
 from app.models.models import Mistake
 
-class AgentState(TypedDict):
-    transcript: str
-    user_id: int
-    conversation_history: List[Dict[str, str]]
-    mistakes_detected: List[Dict[str, Any]]
-    tutor_instruction: str
-    tutor_response: str
+# Initialize the LLM using Gemini
+llm_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip(" '\"")
+api_key = os.getenv("GOOGLE_API_KEY", "").strip(" '\"")
 
-# Initialize the LLM using the same Groq proxy environment
-llm_model = os.getenv("LLM_MODEL", "qwen/qwen3.6-27b").strip(" '\"")
-api_key = os.getenv("API_KEY", "").strip(" '\"")
-base_url = os.getenv("BASE_URL", "https://api.groq.com/openai/v1").strip(" '\"")
-
-llm = ChatOpenAI(
+llm = ChatGoogleGenerativeAI(
     model=llm_model,
-    api_key=api_key,
-    base_url=base_url,
-    temperature=0.7
+    google_api_key=api_key
 )
 
-def analyzer_node(state: AgentState):
-    """Analyzes the transcript for language mistakes and updates the database."""
-    transcript = state["transcript"]
-    user_id = state["user_id"]
-    
-    from langchain_core.output_parsers import PydanticOutputParser
-    
-    parser = PydanticOutputParser(pydantic_object=TranscriptAnalysis)
-    prompt = f"Analyze the following transcript from an English language learner. Identify any grammatical, vocabulary, or pronunciation errors.\n\n{parser.get_format_instructions()}\n\nTranscript: {transcript}"
+@tool
+def analyze_and_log_mistakes(transcript: str, user_id: int = 1) -> str:
+    """Analyzes the user's transcript for grammar mistakes, logs them, and identifies recurring issues. MUST be called on every user input."""
+    analyzer_llm = llm.with_structured_output(TranscriptAnalysis)
+    prompt = f"""
+Analyze the following transcript from an English language learner. Identify any grammatical, vocabulary, or pronunciation errors.
+
+CRITICAL INSTRUCTIONS FOR CATEGORIZATION:
+Do NOT use broad categories like "Grammar", "Vocabulary", or "Syntax". 
+You must pinpoint the exact linguistic rule that was broken. 
+Examples of acceptable categories:
+- "Subject-Verb Agreement"
+- "Past Perfect Tense"
+- "Definite vs. Indefinite Articles"
+- "Prepositions of Time"
+- "Countable vs. Uncountable Nouns"
+- "False Friends (Vocabulary)"
+
+Transcript: {transcript}
+"""
     
     try:
-        response = llm.invoke(prompt)
-        
-        # Clean up <think> blocks before parsing JSON
-        import re
-        content = re.sub(r'<think>.*?(?:</think>|$)', '', response.content, flags=re.DOTALL).strip()
-        # Ensure it starts with JSON
-        if content.startswith("```json"):
-            content = content[7:-3]
-        
-        analysis = parser.invoke(content)
+        analysis = analyzer_llm.invoke(prompt)
         mistakes = [m.model_dump() for m in analysis.mistakes]
     except Exception as e:
-        print("Analysis failed:", e)
+        print("Analysis tool failed:", e)
         mistakes = []
-    
-    # Update DB
+        
     db = SessionLocal()
+    recurring_mistakes = []
     try:
         for m in mistakes:
             existing = db.query(Mistake).filter(
                 Mistake.user_id == user_id, 
-                Mistake.error_text == m["error_text"]
+                Mistake.category == m["category"]
             ).first()
             if existing:
                 existing.count += 1
+                existing.error_text = m["error_text"]
                 existing.correction = m["correction"]
+                if existing.count >= 3:
+                    recurring_mistakes.append(f"'{existing.category}' (made {existing.count} times)")
             else:
                 new_mistake = Mistake(
                     user_id=user_id,
@@ -77,100 +74,33 @@ def analyzer_node(state: AgentState):
     finally:
         db.close()
         
-    return {"mistakes_detected": mistakes}
+    result = f"Mistakes found in this turn: {json.dumps(mistakes)}\n"
+    if recurring_mistakes:
+        result += f"CRITICAL: The user has made these mistakes 3 or more times: {', '.join(recurring_mistakes)}. You MUST call design_lesson for the most critical topic!"
+    else:
+        result += "No recurring mistakes found. No lesson needed right now."
+        
+    return result
 
-def planner_node(state: AgentState):
-    """Decides on the tutoring strategy based on mistakes and history."""
-    mistakes = state.get("mistakes_detected", [])
-    user_id = state["user_id"]
-    
-    # Get recurring mistakes from DB
-    db = SessionLocal()
+@tool
+def design_lesson(topic: str) -> str:
+    """Designs a dynamic 5-question MCQ lesson for a specific grammar or vocabulary topic. Call this when the user has recurring mistakes."""
+    lesson_llm = llm.with_structured_output(Lesson)
+    prompt = f"Design a short English language lesson and a 5-question multiple choice quiz on the topic: {topic}"
     try:
-        recurring = db.query(Mistake).filter(
-            Mistake.user_id == user_id,
-            Mistake.count > 1
-        ).order_by(Mistake.count.desc()).limit(3).all()
-        recurring_texts = [f"'{r.error_text}' (made {r.count} times)" for r in recurring]
-    finally:
-        db.close()
-        
-    from langchain_core.output_parsers import PydanticOutputParser
-    
-    parser = PydanticOutputParser(pydantic_object=TutorInstruction)
-    
-    context = f"Current Mistakes: {mistakes}\n"
-    if recurring_texts:
-        context += f"Recurring Past Mistakes: {', '.join(recurring_texts)}\n"
-        
-    prompt = f"""You are the Planning Agent for an English Tutor. 
-Look at the user's current mistakes and past recurring mistakes.
-Decide how the tutor should respond. 
-If there is a recurring mistake, instruct the tutor to gently correct it. 
-If the mistakes are minor, instruct the tutor to ignore them to keep the conversation flowing naturally.
-
-{parser.get_format_instructions()}
-
-Context:\n{context}"""
-
-    try:
-        response = llm.invoke(prompt)
-        
-        # Clean up <think> blocks before parsing JSON
-        import re
-        content = re.sub(r'<think>.*?(?:</think>|$)', '', response.content, flags=re.DOTALL).strip()
-        if content.startswith("```json"):
-            content = content[7:-3]
-            
-        instruction = parser.invoke(content)
-        tutor_instruction = instruction.instruction
+        lesson_obj = lesson_llm.invoke(prompt)
+        return json.dumps(lesson_obj.model_dump())
     except Exception as e:
-        print("Planner failed:", e)
-        tutor_instruction = "Just respond naturally and friendly."
-        
-    return {"tutor_instruction": tutor_instruction}
+        print("Lesson generation failed:", e)
+        return json.dumps({"error": "Failed to generate lesson."})
 
-def tutor_node(state: AgentState):
-    """Generates the final conversational response."""
-    transcript = state["transcript"]
-    tutor_instruction = state.get("tutor_instruction", "")
-    history = state.get("conversation_history", [])
-    
-    from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-    
-    messages = [
-        SystemMessage(content=f"You are a helpful, friendly English tutor. Keep your responses conversational and relatively short. Do not over-correct every small mistake, just keep the conversation flowing naturally. Follow this specific instruction from the planner: {tutor_instruction}")
-    ]
-    
-    # Add history
-    for msg in history:
-        if msg["role"] == "user":
-            messages.append(HumanMessage(content=msg["content"]))
-        else:
-            messages.append(AIMessage(content=msg["content"]))
-            
-    # Add current transcript
-    messages.append(HumanMessage(content=transcript))
-    
-    response = llm.invoke(messages)
-    
-    # Clean up <think> blocks if present
-    import re
-    response_text = re.sub(r'<think>.*?(?:</think>|$)', '', response.content, flags=re.DOTALL).strip()
-    if not response_text:
-        response_text = "I'm sorry, I was thinking too hard and forgot to answer!"
-        
-    return {"tutor_response": response_text}
+tools = [analyze_and_log_mistakes, design_lesson]
 
-# Compile the graph
-workflow = StateGraph(AgentState)
-workflow.add_node("analyzer", analyzer_node)
-workflow.add_node("planner", planner_node)
-workflow.add_node("tutor", tutor_node)
+system_prompt = """You are an intelligent, friendly English Tutor functioning as a ReAct Agent.
+When the user speaks to you, follow these steps:
+1. ALWAYS call the `analyze_and_log_mistakes` tool first with their transcript to check for errors.
+2. If the tool reports that there is a CRITICAL recurring mistake (made 3 or more times), you MUST call the `design_lesson` tool with the appropriate topic.
+3. Finally, formulate a friendly conversational response to the user. If a lesson was designed, tell them you noticed a recurring mistake and have prepared a quick lesson for them. **CRITICAL: DO NOT output any of the lesson text, explanations, or MCQs in your conversational response.** Keep your chat response very short. The frontend will automatically render the lesson using the tool's data. If no lesson was needed, just continue the conversation naturally. Do not over-correct minor mistakes."""
 
-workflow.set_entry_point("analyzer")
-workflow.add_edge("analyzer", "planner")
-workflow.add_edge("planner", "tutor")
-workflow.add_edge("tutor", END)
-
-tutor_graph = workflow.compile()
+# Create the true ReAct Agent
+tutor_graph = create_react_agent(llm, tools=tools, prompt=system_prompt)
