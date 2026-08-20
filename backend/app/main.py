@@ -77,11 +77,23 @@ def suggest_lesson():
     except Exception as e:
         return {"status": "error", "message": "Failed to generate lesson.", "details": str(e)}
 
+from typing import Optional
+from datetime import datetime
+
 @app.get("/api/conversation/summary")
-def get_summary():
+def get_summary(since: Optional[str] = None):
     db = SessionLocal()
-    # Get top 10 most recent mistakes
-    recent_mistakes = db.query(Mistake).filter(Mistake.user_id == 1).order_by(desc(Mistake.last_seen)).limit(10).all()
+    query = db.query(Mistake).filter(Mistake.user_id == 1)
+    
+    if since:
+        try:
+            # Parse JS ISO string, replacing 'Z' with +00:00 for python 3.10 compatibility
+            since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
+            query = query.filter(Mistake.last_seen >= since_dt)
+        except Exception as e:
+            print("Failed to parse since datetime:", e)
+            
+    recent_mistakes = query.order_by(desc(Mistake.last_seen)).limit(10).all()
     
     mistakes_list = []
     for m in recent_mistakes:
