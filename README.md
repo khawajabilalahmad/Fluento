@@ -45,21 +45,37 @@ When a recurring weakness reaches a defined threshold, Fluento generates a perso
 ## Architecture
 
   User Voice
+
     ↓
+
 Whisper STT
+
     ↓
+
 Conversation Transcript
+
     ↓
+
 LangGraph ReAct Agent
+
     ├── Analyze Mistakes
+
     ├── Query Learner History
+
     ├── Evaluate Recurring Weakness
+
     └── Generate Lesson
+
     ↓
+
 Adaptive Response
+
     ↓
+
 Edge-TTS
+
     ↓
+
 User
 
 ---
