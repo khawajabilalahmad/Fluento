@@ -44,7 +44,7 @@ This document outlines the testing scenarios and results for the Fluento Agentic
 **Scenario:** The SQLite database is temporarily locked or inaccessible when the agent tries to log a mistake.
 **Input:** File permission denied on `fluento.db`.
 **Expected:** The application must catch the database error without bringing down the FastAPI server or breaking the ReAct loop.
-**Actual:** The `try/except` block inside the database transaction catches the `OperationalError`, prints the failure, and returns an empty list of recurring mistakes. The user still receives their chat response without interruption.
+**Actual:** The `try/except` block inside the database transaction catches the `Exception`, prints the failure, and returns an empty list of recurring mistakes. The user still receives their chat response without interruption.
 **Status:** **PASS**
 
 ---
