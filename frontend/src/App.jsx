@@ -118,6 +118,7 @@ function App() {
   const [suggestedLesson, setSuggestedLesson] = useState(null);
   const [summaryData, setSummaryData] = useState(null);
   const [pendingLesson, setPendingLesson] = useState(null);
+  const [sessionStart, setSessionStart] = useState(null);
 
   const [isRecording, setIsRecording] = useState(false)
   const [uploadStatus, setUploadStatus] = useState(null)
@@ -165,11 +166,17 @@ function App() {
     setUploadStatus(null);
   };
 
+  const startChatMode = () => {
+    setSessionStart(new Date().toISOString());
+    setAppMode('chat');
+  };
+
   const endConversation = async () => {
     setAppMode('summary');
     setUploadStatus("Generating your report card...");
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/conversation/summary');
+      const url = sessionStart ? `http://127.0.0.1:8000/api/conversation/summary?since=${encodeURIComponent(sessionStart)}` : 'http://127.0.0.1:8000/api/conversation/summary';
+      const res = await fetch(url);
       const data = await res.json();
       if (data.status === 'success') {
         setSummaryData(data.mistakes);
@@ -322,7 +329,7 @@ function App() {
               </button>
               
               <button 
-                onClick={() => setAppMode('chat')}
+                onClick={startChatMode}
                 className="glass-panel" 
                 style={{ padding: '2rem', borderRadius: '20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1rem', width: '220px', cursor: 'pointer', transition: 'all 0.3s', border: '1px solid rgba(16, 185, 129, 0.3)' }}
                 onMouseOver={(e) => { e.currentTarget.style.transform = 'translateY(-5px)'; e.currentTarget.style.background = 'rgba(16, 185, 129, 0.1)' }}
@@ -347,7 +354,7 @@ function App() {
               </div>
             )}
             {suggestedLesson && (
-              <LessonCard lesson={suggestedLesson} onComplete={() => setAppMode('chat')} />
+              <LessonCard lesson={suggestedLesson} onComplete={startChatMode} />
             )}
           </div>
         )}
